@@ -1,0 +1,106 @@
+name: Publish analysis data for Sites
+
+on:
+  workflow_run:
+    workflows:
+      - 每日股票分析
+    types:
+      - completed
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: publish-sites-report
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Download analysis reports
+        uses: actions/download-artifact@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+          pattern: analysis-reports-*
+          path: downloaded
+          merge-multiple: true
+
+      - name: Build public report feed
+        env:
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
+          SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
+          SOURCE_CREATED_AT: ${{ github.event.workflow_run.created_at }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path("downloaded")
+          candidates = [
+              p for p in root.rglob("*")
+              if p.is_file() and p.suffix.lower() in {".md", ".txt", ".html", ".json"}
+              and "log" not in {part.lower() for part in p.parts}
+          ]
+          if not candidates:
+              raise SystemExit("No report file found in downloaded artifact")
+
+          preferred = [p for p in candidates if p.suffix.lower() in {".md", ".txt"}]
+          selected = max(preferred or candidates, key=lambda p: p.stat().st_mtime)
+          content = selected.read_text(encoding="utf-8", errors="replace")
+
+          payload = {
+              "schema_version": 1,
+              "title": "每日股票分析",
+              "generated_at": os.environ.get("SOURCE_CREATED_AT"),
+              "run_id": os.environ.get("SOURCE_RUN_ID"),
+              "run_number": os.environ.get("SOURCE_RUN_NUMBER"),
+              "run_url": os.environ.get("SOURCE_RUN_URL"),
+              "source_file": selected.name,
+              "format": selected.suffix.lower().lstrip("."),
+              "content": content,
+          }
+
+          out = Path(".sites-feed")
+          out.mkdir(exist_ok=True)
+          (out / "latest.json").write_text(
+              json.dumps(payload, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+          (out / "README.md").write_text(
+              "# daily_stock_analysis public report feed\n\n"
+              "Generated automatically by GitHub Actions for the ChatGPT Sites dashboard.\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Publish site-data branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp -R .sites-feed /tmp/daily-stock-sites-feed
+          if git ls-remote --exit-code --heads origin site-data >/dev/null 2>&1; then
+            git switch --force-create site-data origin/site-data
+          else
+            git switch --orphan site-data
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+          cp /tmp/daily-stock-sites-feed/latest.json latest.json
+          cp /tmp/daily-stock-sites-feed/README.md README.md
+          git add -- latest.json README.md
+          if git diff --cached --quiet; then
+            echo "No report changes to publish"
+            exit 0
+          fi
+          git commit -m "chore: publish analysis report #${SOURCE_RUN_NUMBER:-latest}"
+          git push origin site-data
